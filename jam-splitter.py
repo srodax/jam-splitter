@@ -10,21 +10,31 @@ chronological "bloopers" compilation using a two-stage cascade:
 
 Medleys (back-to-back songs without silence) are intentionally kept as single tracks.
 
+Input modes:
+  --stems   Equal-length WAV stems plus optional per-stem dB balance.
+  --rpp     REAPER project file: parses track alignment and volume, renders
+            aligned stems via ffmpeg (no REAPER install required).
+
+RPP limitations: no FX chains, envelopes, routing, or stretch markers;
+PLAYRATE != 1 uses ffmpeg atempo (approximation); MASTER_VOLUME ignored.
+
 Memory model: stems stay on disk; ffmpeg streams mix/render; analysis reads the
 mono mix and per-segment windows via soundfile only.
 """
 
 import argparse
 import gc
+import math
 import os
+import shutil
 import subprocess
 import sys
 import tempfile
 import threading
 import time
 import warnings
-from dataclasses import dataclass
-from typing import List, Optional, Tuple
+from dataclasses import dataclass, field
+from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 import soundfile as sf
@@ -111,6 +121,42 @@ class AnalysisContext:
     duration_s: float
 
 
+@dataclass
+class RppItem:
+    """One media item on a REAPER track timeline."""
+    source_path: str
+    position: float
+    length: float
+    soffs: float
+    volume: float
+    playrate: float
+
+
+@dataclass
+class RppTrack:
+    """One REAPER track with timeline items."""
+    name: str
+    volume: float
+    items: List[RppItem] = field(default_factory=list)
+
+
+@dataclass
+class RppProject:
+    """Parsed REAPER project used to render aligned stems."""
+    sample_rate: int
+    tracks: List[RppTrack]
+    project_length: float
+
+
+@dataclass
+class _RppChunk:
+    """Internal node in the REAPER chunk tree."""
+    tag: str
+    attrs: List[str]
+    keys: Dict[str, List[str]]
+    children: List["_RppChunk"]
+
+
 # ---------------------------------------------------------------------------
 # Argument parsing
 # ---------------------------------------------------------------------------
@@ -120,15 +166,23 @@ def parse_args() -> argparse.Namespace:
         description="Split multi-stem Jamulus recordings into individual MP3 tracks "
                     "and a bloopers compilation."
     )
-    parser.add_argument(
-        "--stems", nargs="+", required=True,
+    input_group = parser.add_mutually_exclusive_group(required=True)
+    input_group.add_argument(
+        "--stems", nargs="+",
         help="One or more WAV stem files (must all have identical duration)."
+    )
+    input_group.add_argument(
+        "--rpp",
+        help="REAPER project file (.rpp). Stems are aligned and balanced from "
+             "track/item timing and VOLPAN; source media must be reachable "
+             "relative to the project directory."
     )
     parser.add_argument(
         "--dbs", nargs="*", type=float, default=None,
         help="Relative per-stem dB balance in the mix (e.g. 0 -3 2). "
-             "Unmatched stems get 0 dB. Global anti-clip gain is applied "
-             "automatically so the summed mix stays near -1 dBFS."
+             "Unmatched stems get 0 dB. With --rpp, overrides project "
+             "track volumes. Global anti-clip gain is applied automatically "
+             "so the summed mix stays near -1 dBFS."
     )
     parser.add_argument(
         "--aggression", type=int, default=5, choices=range(1, 11),
@@ -173,32 +227,45 @@ def parse_args() -> argparse.Namespace:
 # Aggression / config resolution
 # ---------------------------------------------------------------------------
 
-def resolve_config(args: argparse.Namespace) -> Config:
-    """Merge CLI args with aggression presets.  Explicit overrides take precedence."""
+def _normalize_dbs(dbs: Optional[List[float]], stem_count: int) -> List[float]:
+    """Pad or truncate per-stem dB values to match stem_count."""
+    if dbs is None:
+        return [0.0] * stem_count
+    values = list(dbs)
+    if len(values) > stem_count:
+        print(f"Warning: {len(values)} dB values given for {stem_count} stems; "
+              f"truncating to {stem_count}.", file=sys.stderr)
+        values = values[:stem_count]
+    elif len(values) < stem_count:
+        print(f"Note: {len(values)} dB values given for {stem_count} stems; "
+              f"remaining stems get 0 dB.", file=sys.stderr)
+        values.extend([0.0] * (stem_count - len(values)))
+    return values
+
+
+def resolve_config(
+    args: argparse.Namespace,
+    stem_paths: List[str],
+    dbs: Optional[List[float]] = None,
+) -> Config:
+    """Merge CLI args with aggression presets. Explicit overrides take precedence."""
     preset = AGGRESSION_PRESETS[args.aggression]
 
     silence_thresh = args.silence_thresh if args.silence_thresh is not None else preset[0]
     min_silence_len = args.min_silence_len if args.min_silence_len is not None else preset[1]
     min_track_length = args.min_track_length if args.min_track_length is not None else preset[2]
 
-    # Handle dB values
-    stem_count = len(args.stems)
-    if args.dbs is None:
-        dbs = [0.0] * stem_count
+    stem_count = len(stem_paths)
+    if args.dbs is not None:
+        resolved_dbs = _normalize_dbs(args.dbs, stem_count)
+    elif dbs is not None:
+        resolved_dbs = _normalize_dbs(dbs, stem_count)
     else:
-        dbs = list(args.dbs)
-        if len(dbs) > stem_count:
-            print(f"Warning: {len(dbs)} dB values given for {stem_count} stems; "
-                  f"truncating to {stem_count}.", file=sys.stderr)
-            dbs = dbs[:stem_count]
-        elif len(dbs) < stem_count:
-            print(f"Note: {len(dbs)} dB values given for {stem_count} stems; "
-                  f"remaining stems get 0 dB.", file=sys.stderr)
-            dbs.extend([0.0] * (stem_count - len(dbs)))
+        resolved_dbs = [0.0] * stem_count
 
     return Config(
-        stem_paths=list(args.stems),
-        dbs=dbs,
+        stem_paths=list(stem_paths),
+        dbs=resolved_dbs,
         silence_thresh=silence_thresh,
         min_silence_len=min_silence_len,
         min_track_length=min_track_length,
@@ -208,6 +275,294 @@ def resolve_config(args: argparse.Namespace) -> Config:
         no_librosa=args.no_librosa,
         aggression=args.aggression,
     )
+
+
+# ---------------------------------------------------------------------------
+# REAPER project (.rpp) parsing and aligned stem rendering
+# ---------------------------------------------------------------------------
+
+def _split_rpp_tokens(line: str) -> List[str]:
+    """Split an RPP line into tokens, respecting quoted strings."""
+    tokens: List[str] = []
+    current: List[str] = []
+    in_quote = False
+    for ch in line:
+        if ch == '"':
+            in_quote = not in_quote
+            current.append(ch)
+        elif ch.isspace() and not in_quote:
+            if current:
+                tokens.append("".join(current))
+                current = []
+        else:
+            current.append(ch)
+    if current:
+        tokens.append("".join(current))
+    return tokens
+
+
+def _parse_rpp_tree(path: str) -> _RppChunk:
+    """Parse an .rpp file into a chunk tree (stdlib only)."""
+    root = _RppChunk("ROOT", [], {}, [])
+    stack: List[_RppChunk] = [root]
+
+    with open(path, encoding="utf-8", errors="replace") as handle:
+        for raw_line in handle:
+            stripped = raw_line.strip()
+            if not stripped:
+                continue
+            if stripped == ">":
+                if len(stack) > 1:
+                    stack.pop()
+                continue
+            if stripped.startswith("<"):
+                inner = stripped[1:]
+                parts = _split_rpp_tokens(inner)
+                if not parts:
+                    continue
+                chunk = _RppChunk(parts[0], parts[1:], {}, [])
+                stack[-1].children.append(chunk)
+                stack.append(chunk)
+                continue
+
+            parts = _split_rpp_tokens(stripped)
+            if not parts:
+                continue
+            key = parts[0]
+            stack[-1].keys[key] = parts[1:]
+
+    return root
+
+
+def _strip_rpp_quotes(value: str) -> str:
+    value = value.strip()
+    if len(value) >= 2 and value[0] == '"' and value[-1] == '"':
+        return value[1:-1]
+    return value
+
+
+def _linear_to_db(linear: float) -> float:
+    if linear <= 0.0:
+        return -120.0
+    return 20.0 * math.log10(linear)
+
+
+def _resolve_rpp_media_path(file_ref: str, rpp_dir: str) -> str:
+    """
+    Resolve a SOURCE FILE path from an .rpp.
+
+    Absolute paths (e.g. Synology /volume1/...) are tried first; if missing,
+    fall back to the basename next to the .rpp so projects remain portable.
+    """
+    file_ref = _strip_rpp_quotes(file_ref)
+    joined = os.path.join(rpp_dir, file_ref)
+    if os.path.exists(joined):
+        return joined
+
+    basename_fallback = os.path.join(rpp_dir, os.path.basename(file_ref))
+    if basename_fallback != joined and os.path.exists(basename_fallback):
+        print(f"Note: RPP path not found ({joined}); "
+              f"using local file {basename_fallback}", file=sys.stderr)
+        return basename_fallback
+
+    return joined
+
+
+def _parse_rpp_item(chunk: _RppChunk, rpp_dir: str) -> Optional[RppItem]:
+    source_path = None
+    for child in chunk.children:
+        if child.tag != "SOURCE":
+            continue
+        file_vals = child.keys.get("FILE")
+        if file_vals:
+            source_path = _resolve_rpp_media_path(file_vals[0], rpp_dir)
+
+    if not source_path:
+        return None
+
+    position = float(chunk.keys.get("POSITION", ["0"])[0])
+    length = float(chunk.keys.get("LENGTH", ["0"])[0])
+    soffs = float(chunk.keys.get("SOFFS", ["0"])[0])
+    item_vol = float(chunk.keys.get("VOLPAN", ["1"])[0])
+    playrate = float(chunk.keys.get("PLAYRATE", ["1"])[0])
+
+    return RppItem(
+        source_path=source_path,
+        position=position,
+        length=length,
+        soffs=soffs,
+        volume=item_vol,
+        playrate=playrate,
+    )
+
+
+def _parse_rpp_track(chunk: _RppChunk, rpp_dir: str) -> Optional[RppTrack]:
+    name = _strip_rpp_quotes(chunk.keys.get("NAME", [""])[0])
+    track_vol = float(chunk.keys.get("VOLPAN", ["1"])[0])
+
+    items: List[RppItem] = []
+    for child in chunk.children:
+        if child.tag != "ITEM":
+            continue
+        item = _parse_rpp_item(child, rpp_dir)
+        if item is not None:
+            items.append(item)
+
+    if not items:
+        return None
+
+    return RppTrack(name=name, volume=track_vol, items=items)
+
+
+def parse_rpp(path: str) -> RppProject:
+    """Parse a REAPER project and extract track alignment metadata."""
+    if not os.path.exists(path):
+        print(f"Error: RPP file not found: {path}", file=sys.stderr)
+        sys.exit(1)
+
+    rpp_dir = os.path.dirname(os.path.abspath(path))
+    root = _parse_rpp_tree(path)
+
+    project_chunk = None
+    for child in root.children:
+        if child.tag == "REAPER_PROJECT":
+            project_chunk = child
+            break
+
+    if project_chunk is None:
+        print(f"Error: No REAPER_PROJECT chunk in {path}", file=sys.stderr)
+        sys.exit(1)
+
+    sample_rate = int(float(project_chunk.keys.get("SAMPLERATE", ["48000"])[0]))
+
+    tracks: List[RppTrack] = []
+    for child in project_chunk.children:
+        if child.tag != "TRACK":
+            continue
+        track = _parse_rpp_track(child, rpp_dir)
+        if track is not None:
+            tracks.append(track)
+
+    if not tracks:
+        print(f"Error: No tracks with media items found in {path}", file=sys.stderr)
+        sys.exit(1)
+
+    project_length = max(
+        item.position + item.length
+        for track in tracks
+        for item in track.items
+    )
+
+    return RppProject(
+        sample_rate=sample_rate,
+        tracks=tracks,
+        project_length=project_length,
+    )
+
+
+def _render_track_aligned(
+    track: RppTrack,
+    sample_rate: int,
+    project_length: float,
+    out_path: str,
+) -> None:
+    """Render one RPP track onto a silent timeline of project_length seconds."""
+    inputs: List[str] = []
+    filter_parts: List[str] = []
+
+    for idx, item in enumerate(track.items):
+        if not os.path.exists(item.source_path):
+            print(f"Error: Source media not found: {item.source_path}", file=sys.stderr)
+            sys.exit(1)
+
+        inputs.extend(["-i", item.source_path])
+
+        source_end = item.soffs + item.length * item.playrate
+        chain = (
+            f"[{idx}:a]aformat=channel_layouts=stereo,"
+            f"atrim=start={item.soffs:.9f}:end={source_end:.9f},"
+            f"asetpts=PTS-STARTPTS"
+        )
+        if abs(item.playrate - 1.0) > 1e-6:
+            print(f"Warning: item playrate {item.playrate} on {item.source_path} "
+                  f"— using ffmpeg atempo (approximation).", file=sys.stderr)
+            chain += f",atempo={item.playrate:.9f}"
+
+        item_db = _linear_to_db(item.volume)
+        if abs(item_db) > 1e-6:
+            chain += f",volume={item_db:.4f}dB"
+
+        delay_ms = int(round(item.position * 1000.0))
+        chain += (
+            f",adelay={delay_ms}|{delay_ms},"
+            f"apad=whole_dur={project_length:.9f},"
+            f"atrim=end={project_length:.9f},asetpts=PTS-STARTPTS[ai{idx}]"
+        )
+        filter_parts.append(chain)
+
+    n_items = len(track.items)
+    if n_items == 1:
+        filter_parts.append("[ai0]anull[out]")
+    else:
+        mix_inputs = "".join(f"[ai{i}]" for i in range(n_items))
+        filter_parts.append(
+            f"{mix_inputs}amix=inputs={n_items}:duration=longest:normalize=0[out]"
+        )
+
+    filter_graph = ";".join(filter_parts)
+    cmd = (
+        ["ffmpeg", "-y", "-hide_banner", "-nostats"] + inputs +
+        ["-filter_complex", filter_graph,
+         "-map", "[out]", "-ar", str(sample_rate), "-ac", "2",
+         "-c:a", "pcm_s16le", out_path]
+    )
+
+    label = _track_source_label(track) or os.path.basename(out_path)
+    with _ElapsedIndicator(f"align {label}"):
+        if not _run_ffmpeg(cmd, f"align track {label}"):
+            print(f"Error: failed to render aligned stem for track {label}.",
+                  file=sys.stderr)
+            sys.exit(1)
+
+
+def _track_source_label(track: RppTrack) -> str:
+    """Human-readable label from source WAV basename(s), not RPP display NAME."""
+    names = [os.path.basename(item.source_path) for item in track.items if item.source_path]
+    if not names:
+        return ""
+    if len(names) == 1:
+        return names[0]
+    return f"{names[0]} (+{len(names) - 1} more)"
+
+
+def render_aligned_stems(project: RppProject, out_dir: str) -> Tuple[List[str], List[float]]:
+    """
+    Render each RPP track to an equal-length aligned WAV in out_dir.
+
+    Returns (stem_paths, per_track_dbs) for the existing split pipeline.
+    """
+    os.makedirs(out_dir, exist_ok=True)
+    stem_paths: List[str] = []
+    dbs: List[float] = []
+
+    print(f"  Project length: {project.project_length/60:.1f} min "
+          f"({project.project_length:.1f}s) @ {project.sample_rate} Hz")
+    print(f"  Tracks: {len(project.tracks)}")
+
+    for i, track in enumerate(project.tracks):
+        wav_label = _track_source_label(track) or f"track_{i+1}"
+        safe_name = "".join(
+            ch if ch.isalnum() or ch in "-_" else "_"
+            for ch in os.path.splitext(wav_label)[0]
+        )
+        out_path = os.path.join(out_dir, f"aligned_{i+1:02d}_{safe_name}.wav")
+        print(f"  Track {i+1}/{len(project.tracks)}: {wav_label} "
+              f"({len(track.items)} item(s), vol {_linear_to_db(track.volume):+.2f} dB)")
+        _render_track_aligned(track, project.sample_rate, project.project_length, out_path)
+        stem_paths.append(out_path)
+        dbs.append(_linear_to_db(track.volume))
+
+    return stem_paths, dbs
 
 
 # ---------------------------------------------------------------------------
@@ -1098,10 +1453,8 @@ def print_dry_run(
 # Main
 # ---------------------------------------------------------------------------
 
-def main():
-    args = parse_args()
-    config = resolve_config(args)
-
+def run_pipeline(config: Config) -> None:
+    """Run validation, analysis, classification, and optional rendering."""
     print("=" * 60)
     print("Jam Session Splitter")
     print("=" * 60)
@@ -1164,6 +1517,31 @@ def main():
     finally:
         if analysis.mono_mix_path and os.path.exists(analysis.mono_mix_path):
             os.remove(analysis.mono_mix_path)
+
+
+def main():
+    args = parse_args()
+    aligned_temp_dir: Optional[str] = None
+
+    try:
+        if args.rpp:
+            print("=" * 60)
+            print("RPP input: parsing REAPER project")
+            print("=" * 60)
+            print(f"  {args.rpp}")
+            project = parse_rpp(args.rpp)
+
+            aligned_temp_dir = tempfile.mkdtemp(prefix="jam_splitter_rpp_")
+            print("\n--- Aligned stem rendering ---")
+            stem_paths, rpp_dbs = render_aligned_stems(project, aligned_temp_dir)
+            config = resolve_config(args, stem_paths, dbs=rpp_dbs)
+        else:
+            config = resolve_config(args, args.stems)
+
+        run_pipeline(config)
+    finally:
+        if aligned_temp_dir and os.path.isdir(aligned_temp_dir):
+            shutil.rmtree(aligned_temp_dir, ignore_errors=True)
 
 
 if __name__ == "__main__":
