@@ -5,24 +5,29 @@ Jam Session Splitter
 Splits multi-stem Jamulus WAV recordings into individual MP3 tracks and a
 chronological "bloopers" compilation using a two-stage cascade:
 
-  Stage 1: Conservative silence detection (pydub.silence)
+  Stage 1: Conservative silence detection (chunked RMS scan)
   Stage 2: Librosa spectral classification + onset-backtracked boundary refinement
 
 Medleys (back-to-back songs without silence) are intentionally kept as single tracks.
+
+Memory model: stems stay on disk; ffmpeg streams mix/render; analysis reads the
+mono mix and per-segment windows via soundfile only.
 """
 
 import argparse
+import gc
 import os
+import subprocess
 import sys
+import tempfile
 import threading
 import time
 import warnings
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import List, Optional, Tuple
 
 import numpy as np
-from pydub import AudioSegment
-from pydub.silence import detect_silence, detect_nonsilent
+import soundfile as sf
 
 # ---------------------------------------------------------------------------
 # Aggression preset table: aggression -> (silence_thresh_dBFS, min_silence_s, min_track_s)
@@ -54,6 +59,12 @@ MIN_LIBROSA_DURATION_S = 2.0  # skip librosa analysis on segments shorter than t
 # Onset backtracking: how far to look inward from a boundary (seconds)
 ONSET_BACKTRACK_WINDOW = 2.0
 
+# Phase 1 scan step — matches former pydub seek_step (ms)
+SILENCE_SEEK_STEP_MS = 10
+
+# 16-bit PCM full-scale (pydub default for WAV)
+MAX_POSSIBLE_AMPLITUDE = 32768.0
+
 
 # ---------------------------------------------------------------------------
 # Data classes
@@ -84,6 +95,14 @@ class Config:
     dry_run: bool
     no_librosa: bool
     aggression: int
+
+
+@dataclass
+class AnalysisContext:
+    """Paths and metadata for the downsampled mono analysis mix."""
+    mono_mix_path: str
+    sample_rate: int
+    duration_s: float
 
 
 # ---------------------------------------------------------------------------
@@ -226,111 +245,262 @@ def _format_size(num_bytes: int) -> str:
 
 
 # ---------------------------------------------------------------------------
-# Stem loading & validation
+# ffmpeg / ffprobe helpers
 # ---------------------------------------------------------------------------
 
-def load_and_validate_stems(config: Config) -> Tuple[List[AudioSegment], AudioSegment]:
+def _run_ffmpeg(cmd: List[str], label: str = "") -> bool:
+    """Run ffmpeg, printing output on failure. Returns True on success."""
+    try:
+        subprocess.run(cmd, check=True, capture_output=True, text=True)
+        return True
+    except subprocess.CalledProcessError as e:
+        print(f"\nffmpeg error ({label}):", file=sys.stderr)
+        print(e.stderr[-2000:], file=sys.stderr)
+        return False
+
+
+def _get_duration_seconds(path: str) -> float:
+    """Get audio duration in seconds via ffprobe."""
+    result = subprocess.run(
+        ["ffprobe", "-v", "error", "-show_entries", "format=duration",
+         "-of", "default=noprint_wrappers=1:nokey=1", path],
+        capture_output=True, text=True, check=True,
+    )
+    return float(result.stdout.strip())
+
+
+def _get_sample_rate(path: str) -> int:
+    """Get audio sample rate via ffprobe."""
+    result = subprocess.run(
+        ["ffprobe", "-v", "error", "-select_streams", "a:0",
+         "-show_entries", "stream=sample_rate",
+         "-of", "default=noprint_wrappers=1:nokey=1", path],
+        capture_output=True, text=True, check=True,
+    )
+    return int(float(result.stdout.strip()))
+
+
+# ---------------------------------------------------------------------------
+# Stem validation & analysis mix (memory-safe)
+# ---------------------------------------------------------------------------
+
+def prepare_analysis_mix(config: Config) -> AnalysisContext:
     """
-    Load all stems as pydub AudioSegments, validate equal length,
-    return (list_of_stems, mono_mixdown).
+    Validate stems via ffprobe, stream a full-rate mono mix to a temp WAV via ffmpeg.
+
+    The mix uses amix normalize=0 to match pydub overlay (additive, no divide).
     """
     if not config.stem_paths:
         print("Error: No stem files provided.", file=sys.stderr)
         sys.exit(1)
 
-    stems = []
     durations = []
+    sample_rate = None
     for i, path in enumerate(config.stem_paths):
         if not os.path.exists(path):
             print(f"Error: File not found: {path}", file=sys.stderr)
             sys.exit(1)
 
+        dur_s = _get_duration_seconds(path)
+        durations.append(dur_s)
         file_size = os.path.getsize(path)
-        label = (f"Loading stem {i+1}/{len(config.stem_paths)}: "
-                 f"{os.path.basename(path)} ({_format_size(file_size)})")
-        print(label, flush=True)
+        print(f"  Stem {i+1}/{len(config.stem_paths)}: {os.path.basename(path)} "
+              f"({_format_size(file_size)}, {dur_s/60:.1f} min)")
 
-        with _ElapsedIndicator("Decoding WAV via ffmpeg..."):
-            seg = AudioSegment.from_file(path)
+        if sample_rate is None:
+            sample_rate = _get_sample_rate(path)
 
-        stems.append(seg)
-        durations.append(len(seg))
-        print(f"  → loaded in {durations[-1]/1000:.1f}s")
-
-    # Validate equal length
-    ref_dur = durations[0]
-    for i, dur in enumerate(durations[1:], start=2):
-        diff_ms = abs(dur - ref_dur)
-        if diff_ms > 100:  # allow 100ms tolerance
-            print(f"Error: Stem {i} duration ({dur/1000:.1f}s) differs from "
-                  f"stem 1 ({ref_dur/1000:.1f}s) by {diff_ms/1000:.1f}s. "
+    ref_dur_s = durations[0]
+    for i, dur_s in enumerate(durations[1:], start=2):
+        diff_ms = abs(dur_s - ref_dur_s) * 1000
+        if diff_ms > 100:
+            print(f"Error: Stem {i} duration ({dur_s:.1f}s) differs from "
+                  f"stem 1 ({ref_dur_s:.1f}s) by {diff_ms/1000:.1f}s. "
                   f"All stems must have identical duration.", file=sys.stderr)
             sys.exit(1)
         elif diff_ms > 0:
-            print(f"Note: Stem {i} differs from stem 1 by {diff_ms}ms — "
+            print(f"Note: Stem {i} differs from stem 1 by {diff_ms:.0f}ms — "
                   f"within tolerance, continuing.")
 
-    total_duration_s = ref_dur / 1000.0
-    print(f"Loaded {len(stems)} stem(s), duration: "
-          f"{total_duration_s/60:.1f} min ({total_duration_s:.1f}s)")
+    print(f"Validated {len(config.stem_paths)} stem(s), duration: "
+          f"{ref_dur_s/60:.1f} min ({ref_dur_s:.1f}s) @ {sample_rate} Hz")
 
-    # Apply dB gain and create mono mixdown for analysis
-    adjusted_stems = []
-    for i, (stem, db) in enumerate(zip(stems, config.dbs)):
+    fd, mono_path = tempfile.mkstemp(suffix=".wav", prefix="jam_splitter_mono_")
+    os.close(fd)
+
+    inputs: List[str] = []
+    for path in config.stem_paths:
+        inputs.extend(["-i", path])
+
+    filter_parts: List[str] = []
+    for i, db in enumerate(config.dbs):
+        chain = f"[{i}:a]"
         if db != 0:
-            stem = stem.apply_gain(db)
-        # Convert to mono for mixing
-        if stem.channels > 1:
-            mono = stem.set_channels(1)
-        else:
-            mono = stem
-        adjusted_stems.append(mono)
+            chain += f"volume={db}dB,"
+        chain += "aformat=channel_layouts=mono"
+        filter_parts.append(f"{chain}[m{i}]")
 
-    # Mix down to mono: overlay all stems
-    mixed = adjusted_stems[0]
-    for s in adjusted_stems[1:]:
-        mixed = mixed.overlay(s)
+    mix_inputs = "".join(f"[m{i}]" for i in range(len(config.stem_paths)))
+    n_stems = len(config.stem_paths)
+    filter_parts.append(
+        f"{mix_inputs}amix=inputs={n_stems}:duration=longest:normalize=0[aout]"
+    )
+    filter_graph = ";".join(filter_parts)
 
-    return stems, mixed
+    cmd = (
+        ["ffmpeg", "-y"] + inputs +
+        ["-filter_complex", filter_graph,
+         "-map", "[aout]", "-ac", "1", "-c:a", "pcm_s16le", mono_path]
+    )
+
+    print("  Creating mono analysis mix via ffmpeg ...")
+    with _ElapsedIndicator("ffmpeg mixdown"):
+        if not _run_ffmpeg(cmd, "mono mixdown"):
+            os.remove(mono_path)
+            print("Error: ffmpeg mixdown failed.", file=sys.stderr)
+            sys.exit(1)
+
+    mono_size = os.path.getsize(mono_path)
+    print(f"  Mono mix: {_format_size(mono_size)} (on disk, not loaded into RAM)")
+
+    return AnalysisContext(
+        mono_mix_path=mono_path,
+        sample_rate=sample_rate,
+        duration_s=ref_dur_s,
+    )
 
 
 # ---------------------------------------------------------------------------
-# Phase 1: Conservative silence detection
+# Phase 1: Conservative silence detection (chunked, pydub-compatible)
 # ---------------------------------------------------------------------------
+
+def _amp_thresh_from_dbfs(dbfs: float) -> float:
+    """Convert dBFS threshold to absolute RMS amplitude (pydub semantics)."""
+    return (10.0 ** (dbfs / 20.0)) * MAX_POSSIBLE_AMPLITUDE
+
+
+def _chunk_rms_amplitude(samples: np.ndarray) -> float:
+    """RMS amplitude on the same scale as pydub/audioop (0 .. 32768)."""
+    if samples.size == 0:
+        return 0.0
+    rms = float(np.sqrt(np.mean(samples.astype(np.float64) ** 2)))
+    return rms * MAX_POSSIBLE_AMPLITUDE
+
+
+def _detect_silent_ranges_ms(
+    duration_ms: float,
+    silence_thresh_dbfs: float,
+    min_silence_len_ms: int,
+    seek_step_ms: int,
+    rms_at_ms,
+) -> List[Tuple[float, float]]:
+    """
+    Replicate pydub.silence.detect_silence + invert for nonsilent ranges.
+
+    rms_at_ms(start_ms) -> RMS amplitude for [start_ms, start_ms+seek_step_ms).
+    """
+    amp_thresh = _amp_thresh_from_dbfs(silence_thresh_dbfs)
+    silent_ranges: List[Tuple[float, float]] = []
+    in_silence = False
+    silence_start = 0.0
+
+    pos_ms = 0.0
+    while pos_ms < duration_ms:
+        rms = rms_at_ms(pos_ms)
+        is_silent = rms <= amp_thresh
+
+        if is_silent:
+            if not in_silence:
+                silence_start = pos_ms
+                in_silence = True
+        elif in_silence:
+            silence_end = pos_ms
+            if silence_end - silence_start >= min_silence_len_ms:
+                silent_ranges.append((silence_start, silence_end))
+            in_silence = False
+
+        pos_ms += seek_step_ms
+
+    if in_silence and duration_ms - silence_start >= min_silence_len_ms:
+        silent_ranges.append((silence_start, duration_ms))
+
+    return silent_ranges
+
+
+def _invert_ranges(
+    silent_ranges: List[Tuple[float, float]],
+    duration_ms: float,
+) -> List[Tuple[float, float]]:
+    """Convert silent ranges to non-silent ranges (pydub detect_nonsilent)."""
+    nonsilent: List[Tuple[float, float]] = []
+    prev_end = 0.0
+    for start_ms, end_ms in silent_ranges:
+        if start_ms > prev_end:
+            nonsilent.append((prev_end, start_ms))
+        prev_end = end_ms
+    if prev_end < duration_ms:
+        nonsilent.append((prev_end, duration_ms))
+    return nonsilent
+
 
 def detect_super_segments(
-    audio: AudioSegment,
+    analysis: AnalysisContext,
     silence_thresh: float,
     min_silence_len_s: float,
 ) -> List[Segment]:
     """
-    Detect non-silent regions (super-segments) using pydub.silence.
+    Detect non-silent regions using chunked RMS scan over the mono mix file.
     Returns list of Segments with start_ms, end_ms, duration_s.
     """
     min_silence_ms = int(min_silence_len_s * 1000)
+    seek_step_ms = SILENCE_SEEK_STEP_MS
+    duration_ms = analysis.duration_s * 1000.0
 
     print(f"Phase 1: Scanning for silence gaps "
           f"(thresh={silence_thresh} dBFS, min_silence={min_silence_len_s}s) ...", flush=True)
 
+    # Block reader: load only small windows from disk
+    block_ms = 60_000  # 1 minute blocks
+    block_frames_cache: dict = {}
+
+    def rms_at_ms(pos_ms: float) -> float:
+        block_start_ms = int(pos_ms // block_ms) * block_ms
+        if block_start_ms not in block_frames_cache:
+            with sf.SoundFile(analysis.mono_mix_path, "r") as wav:
+                sr = wav.samplerate
+                start_frame = int(block_start_ms / 1000.0 * sr)
+                n_frames = int(block_ms / 1000.0 * sr)
+                wav.seek(start_frame)
+                data = wav.read(n_frames, dtype="float32", always_2d=True)
+                if data.ndim == 2:
+                    data = data.mean(axis=1)
+                block_frames_cache.clear()  # keep one block at a time
+                block_frames_cache[block_start_ms] = (sr, data)
+
+        sr, block = block_frames_cache[block_start_ms]
+        rel_ms = pos_ms - block_start_ms
+        start_frame = int(rel_ms / 1000.0 * sr)
+        end_frame = int((rel_ms + seek_step_ms) / 1000.0 * sr)
+        end_frame = max(end_frame, start_frame + 1)
+        chunk = block[start_frame:end_frame]
+        return _chunk_rms_amplitude(chunk)
+
     with _ElapsedIndicator("Scanning"):
-        nonsilent_ranges = detect_nonsilent(
-            audio,
-            min_silence_len=min_silence_ms,
-            silence_thresh=silence_thresh,
-            seek_step=10,
+        silent_ranges = _detect_silent_ranges_ms(
+            duration_ms,
+            silence_thresh,
+            min_silence_ms,
+            seek_step_ms,
+            rms_at_ms,
         )
+        nonsilent_ranges = _invert_ranges(silent_ranges, duration_ms)
+
+    block_frames_cache.clear()
+    gc.collect()
 
     if not nonsilent_ranges:
         print("Warning: No non-silent audio detected in the recording.", file=sys.stderr)
         return []
-
-    # Also detect leading/trailing silence by checking the full range
-    silent_ranges = detect_silence(
-        audio,
-        min_silence_len=min_silence_ms,
-        silence_thresh=silence_thresh,
-        seek_step=10,
-    )
 
     segments = []
     for start_ms, end_ms in nonsilent_ranges:
@@ -359,9 +529,25 @@ def _try_import_librosa() -> bool:
         return False
 
 
+def _read_mono_segment(path: str, start_ms: float, end_ms: float) -> Tuple[np.ndarray, int]:
+    """Read a mono float32 segment from a WAV file via soundfile seek."""
+    with sf.SoundFile(path, "r") as wav:
+        sr = wav.samplerate
+        start_frame = int(start_ms / 1000.0 * sr)
+        end_frame = int(end_ms / 1000.0 * sr)
+        n_frames = max(end_frame - start_frame, 0)
+        wav.seek(start_frame)
+        data = wav.read(n_frames, dtype="float32", always_2d=True)
+        if data.ndim == 2 and data.shape[1] > 1:
+            data = data.mean(axis=1)
+        else:
+            data = data.reshape(-1)
+        return data, sr
+
+
 def librosa_classify_segments(
     segments: List[Segment],
-    mixed_audio: AudioSegment,
+    analysis: AnalysisContext,
 ) -> List[Segment]:
     """
     Run librosa spectral analysis on each segment:
@@ -371,21 +557,14 @@ def librosa_classify_segments(
 
     Modifies segments in-place and returns the updated list.
     """
-    import librosa
-
-    # Export the full mix to a temporary WAV for librosa loading
-    # (pydub AudioSegment -> numpy is possible but librosa loading is simpler)
-    sr = mixed_audio.frame_rate
     total = len(segments)
 
     for i, seg in enumerate(segments):
-        # Compact progress line (overwritten via \r in stderr)
         pct = (i + 1) / total * 100
         sys.stderr.write(f"\r  Phase 2: [{i+1}/{total}] {pct:.0f}%  "
                          f"({seg.duration_s:.1f}s @ {seg.start_ms/1000:.1f})  ")
         sys.stderr.flush()
 
-        # Skip very short segments — librosa analysis is not meaningful
         if seg.duration_s < MIN_LIBROSA_DURATION_S:
             seg.musicality_score = 0.0
             seg.is_track = False
@@ -393,28 +572,24 @@ def librosa_classify_segments(
             seg.onset_refined_end_ms = seg.end_ms
             continue
 
-        # Extract segment audio as numpy array
-        chunk = mixed_audio[int(seg.start_ms):int(seg.end_ms)]
-        samples = np.array(chunk.get_array_of_samples(), dtype=np.float32) / (2 ** 15)
+        samples, sr = _read_mono_segment(
+            analysis.mono_mix_path, seg.start_ms, seg.end_ms
+        )
 
-        # If stereo, average to mono
-        if chunk.channels > 1:
-            samples = samples.reshape(-1, chunk.channels).mean(axis=1)
-
-        # Compute spectral features
         musicality = _compute_musicality(samples, sr)
         seg.musicality_score = musicality
         seg.is_track = musicality >= MUSICALITY_THRESHOLD
 
-        # Onset backtracking boundary refinement
         refined_start, refined_end = _refine_boundaries(samples, sr, seg)
         seg.onset_refined_start_ms = refined_start + seg.start_ms
         seg.onset_refined_end_ms = refined_end + seg.start_ms
 
-    # Clear progress line
+        del samples
+
     sys.stderr.write("\r" + " " * 80 + "\r")
     sys.stderr.flush()
     print(f"Phase 2: Analyzed {total} segment(s)")
+    gc.collect()
 
     return segments
 
@@ -432,63 +607,45 @@ def _compute_musicality(samples: np.ndarray, sr: int) -> float:
     import librosa
 
     w = MUSICALITY_WEIGHTS
-    nyquist = sr / 2.0
 
-    # Use adaptive n_fft for short signals to avoid librosa warnings
     min_n_fft = 256
     desired_n_fft = 2048
     n_fft = min(desired_n_fft, max(min_n_fft, len(samples) // 2))
-    n_fft = 2 ** int(np.log2(n_fft))  # round down to power of 2
+    n_fft = 2 ** int(np.log2(n_fft))
     hop_length = n_fft // 4
 
     with warnings.catch_warnings():
         warnings.filterwarnings("ignore", message="n_fft=.* is too large")
 
-        # Spectral centroid — normalize by nyquist (centroids rarely exceed 8 kHz)
         centroid = librosa.feature.spectral_centroid(
             y=samples, sr=sr, n_fft=n_fft, hop_length=hop_length
         )
     centroid_mean = float(np.mean(centroid))
 
-    # Spectral bandwidth — normalize by nyquist
     bandwidth = librosa.feature.spectral_bandwidth(
         y=samples, sr=sr, n_fft=n_fft, hop_length=hop_length
     )
     bandwidth_mean = float(np.mean(bandwidth))
 
-    # RMS energy — normalize by a reasonable ceiling for 16-bit audio
     rms = librosa.feature.rms(y=samples, frame_length=n_fft, hop_length=hop_length)
     rms_mean = float(np.mean(rms))
 
-    # Spectral flux variance — higher variance = more dynamic (typical of music)
     onset_env = librosa.onset.onset_strength(
         y=samples, sr=sr, n_fft=n_fft, hop_length=hop_length
     )
     flux_var = float(np.var(onset_env))
 
-    # --- Normalize each feature to [0, 1] ---
-    # Centroid: speech ~500-1500 Hz, full band ~2000-5000 Hz
-    # Use a sigmoid-like mapping around 2000 Hz
     norm_centroid = _sigmoid_normalize(centroid_mean, center=2000.0, scale=800.0)
-
-    # Bandwidth: speech ~500-2000 Hz, full band ~2000-6000 Hz
     norm_bandwidth = _sigmoid_normalize(bandwidth_mean, center=2500.0, scale=1000.0)
-
-    # RMS: speech ~0.02-0.08, full band ~0.05-0.25 (varies a lot)
     norm_rms = _sigmoid_normalize(rms_mean, center=0.06, scale=0.03)
-
-    # Flux variance: speech ~0.1-1.0, full band ~1.0-15.0
     norm_flux_var = _sigmoid_normalize(flux_var, center=3.0, scale=2.0)
 
-    # Weighted sum
     score = (
         w["centroid"] * norm_centroid +
         w["bandwidth"] * norm_bandwidth +
         w["rms"] * norm_rms +
         w["flux_variance"] * norm_flux_var
     )
-
-    # Normalize by sum of absolute weights so the maximum possible is ~1.0
     score = score / sum(abs(v) for v in w.values())
 
     return float(max(0.0, min(1.0, score)))
@@ -514,11 +671,9 @@ def _refine_boundaries(
     """
     import librosa
 
-    # Safety: don't try to refine very short segments
     if seg.duration_s < 3.0:
         return 0.0, seg.duration_s * 1000
 
-    # Adaptive n_fft for short signals
     min_n_fft = 256
     desired_n_fft = 2048
     n_fft = min(desired_n_fft, max(min_n_fft, len(samples) // 2))
@@ -528,7 +683,6 @@ def _refine_boundaries(
     with warnings.catch_warnings():
         warnings.filterwarnings("ignore", message="n_fft=.* is too large")
 
-        # Compute onset strength
         onset_env = librosa.onset.onset_strength(
             y=samples, sr=sr, n_fft=n_fft, hop_length=hop_length
         )
@@ -537,7 +691,6 @@ def _refine_boundaries(
 
     frame_time_ms = hop_length / sr * 1000
 
-    # Find onsets near the start boundary (look inward from start)
     backtrack_window_frames = int(ONSET_BACKTRACK_WINDOW * sr / hop_length)
     start_search_end = min(backtrack_window_frames, len(onset_env))
 
@@ -548,7 +701,6 @@ def _refine_boundaries(
         if len(peaks_start) > 0:
             start_idx = peaks_start[0]
 
-    # Find onsets near the end boundary (look inward from end)
     end_search_start = max(0, len(onset_env) - backtrack_window_frames)
     end_search = onset_env[end_search_start:]
 
@@ -561,17 +713,12 @@ def _refine_boundaries(
     refined_start_ms = start_idx * frame_time_ms
     refined_end_ms = end_idx * frame_time_ms
 
-    # Don't refine beyond the original boundaries
     refined_start_ms = max(0.0, refined_start_ms)
     refined_end_ms = min(seg.duration_s * 1000, refined_end_ms)
 
-    # Don't let refinement eat the whole segment
-    if refined_end_ms - refined_start_ms < 500:  # at least 500ms
+    if refined_end_ms - refined_start_ms < 500:
         refined_start_ms = 0.0
         refined_end_ms = seg.duration_s * 1000
-
-    start_delta_ms = refined_start_ms
-    end_delta_ms = refined_end_ms - (seg.duration_s * 1000)
 
     return refined_start_ms, refined_end_ms
 
@@ -617,19 +764,15 @@ def finalize_segments(segments: List[Segment], min_track_length: float) -> Tuple
         score = seg.musicality_score if seg.musicality_score is not None else 0.0
 
         if seg.duration_s < min_track_length:
-            # Too short to be a track
             seg.is_track = False
             bloopers.append(seg)
         elif score >= MUSICALITY_THRESHOLD:
-            # Clearly musical — definite track
             seg.is_track = True
             tracks.append(seg)
         elif score < MUSICALITY_LOW_THRESHOLD:
-            # Long but clearly non-musical (extended talking) — blooper
             seg.is_track = False
             bloopers.append(seg)
         else:
-            # Ambiguous but long enough — keep as track
             seg.is_track = True
             tracks.append(seg)
 
@@ -639,89 +782,132 @@ def finalize_segments(segments: List[Segment], min_track_length: float) -> Tuple
 
 
 # ---------------------------------------------------------------------------
-# Rendering
+# Rendering (ffmpeg streaming)
 # ---------------------------------------------------------------------------
 
 def render_outputs(
-    stems: List[AudioSegment],
+    stem_paths: List[str],
     dbs: List[float],
     tracks: List[Segment],
     bloopers: List[Segment],
     config: Config,
 ):
-    """Render tracks and bloopers to MP3 files."""
+    """Render tracks and bloopers using ffmpeg (streaming, low memory)."""
     os.makedirs(config.output_dir, exist_ok=True)
 
-    # Render tracks
     for i, seg in enumerate(tracks):
         out_path = os.path.join(config.output_dir, f"track_{i+1:02d}.mp3")
-        label = f"Rendering track {i+1}/{len(tracks)} ({seg.duration_s:.1f}s)"
+        start_ms = seg.onset_refined_start_ms if seg.onset_refined_start_ms is not None else seg.start_ms
+        end_ms = seg.onset_refined_end_ms if seg.onset_refined_end_ms is not None else seg.end_ms
+        start_s = start_ms / 1000.0
+        dur_s = (end_ms - start_ms) / 1000.0
+
+        label = f"Rendering track {i+1}/{len(tracks)} ({dur_s:.1f}s)"
         sys.stderr.write(f"\r  {label} ...")
         sys.stderr.flush()
 
-        start_ms = seg.onset_refined_start_ms if seg.onset_refined_start_ms is not None else seg.start_ms
-        end_ms = seg.onset_refined_end_ms if seg.onset_refined_end_ms is not None else seg.end_ms
-        start_ms = int(start_ms)
-        end_ms = int(end_ms)
-
         with _ElapsedIndicator("Encoding MP3"):
-            mixed = _mix_stems_range(stems, dbs, start_ms, end_ms)
-            mixed.export(out_path, format="mp3", bitrate=config.bitrate)
+            if not _render_range_ffmpeg(stem_paths, dbs, start_s, dur_s, out_path, config.bitrate):
+                print(f"Error: failed to render {out_path}", file=sys.stderr)
+                sys.exit(1)
 
         sys.stderr.write(f"\r  {label} → {out_path}\n")
         sys.stderr.flush()
 
-    # Render bloopers (concatenated chronologically)
     if bloopers:
         out_path = os.path.join(config.output_dir, "bloopers.mp3")
         total_blooper_s = sum(s.duration_s for s in bloopers)
         print(f"Rendering bloopers: {len(bloopers)} segments ({total_blooper_s:.1f}s total)")
 
-        blooper_chunks = []
-        for i, seg in enumerate(bloopers):
-            sys.stderr.write(f"\r  Extracting blooper {i+1}/{len(bloopers)} ...")
+        temp_files: List[str] = []
+        try:
+            for i, seg in enumerate(bloopers):
+                fd, tmp = tempfile.mkstemp(suffix=".wav", prefix=f"jam_splitter_blooper_{i:04d}_")
+                os.close(fd)
+                temp_files.append(tmp)
+                start_s = seg.start_ms / 1000.0
+                dur_s = seg.duration_s
+                sys.stderr.write(f"\r  Extracting blooper {i+1}/{len(bloopers)} ...")
+                sys.stderr.flush()
+                if not _render_range_ffmpeg(stem_paths, dbs, start_s, dur_s, tmp, "pcm_s16le"):
+                    print(f"Error: failed to extract blooper segment {i+1}", file=sys.stderr)
+                    sys.exit(1)
+
+            sys.stderr.write("\r" + " " * 80 + "\r")
             sys.stderr.flush()
-            start_ms = int(seg.start_ms)
-            end_ms = int(seg.end_ms)
-            chunk = _mix_stems_range(stems, dbs, start_ms, end_ms)
-            blooper_chunks.append(chunk)
 
-        sys.stderr.write("\r" + " " * 80 + "\r")
-        sys.stderr.flush()
+            fd, concat_list = tempfile.mkstemp(suffix=".txt", prefix="jam_splitter_concat_")
+            os.close(fd)
+            try:
+                with open(concat_list, "w", encoding="utf-8") as f:
+                    for tf in temp_files:
+                        escaped = tf.replace("'", "'\\''")
+                        f.write(f"file '{escaped}'\n")
 
-        if blooper_chunks:
-            print(f"  Concatenating {len(blooper_chunks)} chunks ...")
-            combined = blooper_chunks[0]
-            for chunk in blooper_chunks[1:]:
-                combined = combined.append(chunk, crossfade=0)
+                print(f"  Concatenating {len(temp_files)} blooper chunks ...")
+                with _ElapsedIndicator("Encoding bloopers MP3"):
+                    subprocess.run(
+                        ["ffmpeg", "-y", "-f", "concat", "-safe", "0",
+                         "-i", concat_list, "-c:a", "libmp3lame",
+                         "-b:a", config.bitrate, out_path],
+                        check=True, capture_output=True, text=True,
+                    )
+            finally:
+                if os.path.exists(concat_list):
+                    os.remove(concat_list)
 
-            with _ElapsedIndicator("Encoding bloopers MP3"):
-                combined.export(out_path, format="mp3", bitrate=config.bitrate)
             print(f"  → {out_path}")
+        finally:
+            for tf in temp_files:
+                if os.path.exists(tf):
+                    os.remove(tf)
     else:
         print("No bloopers to render.")
 
 
-def _mix_stems_range(
-    stems: List[AudioSegment],
+def _render_range_ffmpeg(
+    stem_paths: List[str],
     dbs: List[float],
-    start_ms: int,
-    end_ms: int,
-) -> AudioSegment:
-    """Mix all stems for a given time range with per-stem dB levels."""
-    mixed = None
-    for i, (stem, db) in enumerate(zip(stems, dbs)):
-        chunk = stem[start_ms:end_ms]
+    start_s: float,
+    dur_s: float,
+    out_path: str,
+    bitrate_or_codec: str,
+) -> bool:
+    """Render a time range from all stems via ffmpeg amix (normalize=0, pydub-compatible)."""
+    inputs: List[str] = []
+    for path in stem_paths:
+        inputs.extend(["-ss", f"{start_s:.6f}", "-i", path])
+
+    filter_parts: List[str] = []
+    for i, db in enumerate(dbs):
         if db != 0:
-            chunk = chunk.apply_gain(db)
-        if mixed is None:
-            mixed = chunk
+            filter_parts.append(f"[{i}:a]volume={db}dB[a{i}]")
         else:
-            mixed = mixed.overlay(chunk)
-    # Convert to stereo if mono
-    if mixed.channels == 1:
-        mixed = mixed.set_channels(2)
-    return mixed
+            filter_parts.append(f"[{i}:a]anull[a{i}]")
+
+    mix_inputs = "".join(f"[a{i}]" for i in range(len(stem_paths)))
+    n_stems = len(stem_paths)
+    # Force stereo output to match pydub set_channels(2) on mono mixes
+    filter_parts.append(
+        f"{mix_inputs}amix=inputs={n_stems}:duration=longest:normalize=0,"
+        f"aformat=channel_layouts=stereo[out]"
+    )
+    filter_graph = ";".join(filter_parts)
+
+    cmd = (
+        ["ffmpeg", "-y"] + inputs +
+        ["-t", f"{dur_s:.6f}",
+         "-filter_complex", filter_graph,
+         "-map", "[out]", "-map_metadata", "-1"]
+    )
+
+    if out_path.endswith(".mp3"):
+        cmd.extend(["-c:a", "libmp3lame", "-b:a", bitrate_or_codec])
+    else:
+        cmd.extend(["-c:a", bitrate_or_codec])
+
+    cmd.append(out_path)
+    return _run_ffmpeg(cmd, f"render {os.path.basename(out_path)}")
 
 
 # ---------------------------------------------------------------------------
@@ -733,13 +919,14 @@ def print_dry_run(
     tracks: List[Segment],
     bloopers: List[Segment],
     config: Config,
+    total_duration_s: float,
 ):
     """Print detailed segment analysis without rendering."""
     print("\n" + "=" * 80)
     print("DRY RUN — Segment Analysis")
     print("=" * 80)
     print(f"Stems:          {len(config.stem_paths)} file(s)")
-    print(f"Duration:       {segments[0].end_ms/1000:.1f}s" if segments else "N/A")
+    print(f"Duration:       {total_duration_s:.1f}s")
     print(f"Silence thresh: {config.silence_thresh} dBFS")
     print(f"Min silence:    {config.min_silence_len}s")
     print(f"Min track len:  {config.min_track_length}s")
@@ -786,7 +973,6 @@ def main():
           f"min_silence={config.min_silence_len}s, "
           f"min_track={config.min_track_length}s")
 
-    # Check librosa availability
     librosa_available = _try_import_librosa()
     if config.no_librosa:
         print("Phase 2 (librosa) disabled via --no-librosa.")
@@ -795,44 +981,49 @@ def main():
               "Install with: pip install librosa", file=sys.stderr)
         config.no_librosa = True
 
-    # Load and validate stems
-    stems, mono_mix = load_and_validate_stems(config)
+    print("\n--- Stem validation & analysis mix ---")
+    analysis = prepare_analysis_mix(config)
+    gc.collect()
 
-    # Phase 1: Silence detection
-    print("\n--- Phase 1: Silence Detection ---")
-    segments = detect_super_segments(
-        mono_mix,
-        config.silence_thresh,
-        config.min_silence_len,
-    )
+    try:
+        print("\n--- Phase 1: Silence Detection ---")
+        segments = detect_super_segments(
+            analysis,
+            config.silence_thresh,
+            config.min_silence_len,
+        )
 
-    if not segments:
-        print("No audio segments detected. Exiting.", file=sys.stderr)
-        sys.exit(0)
+        if not segments:
+            print("No audio segments detected. Exiting.", file=sys.stderr)
+            sys.exit(0)
 
-    # Phase 2: Librosa classification + refinement
-    if not config.no_librosa:
-        print("\n--- Phase 2: Librosa Spectral Analysis ---")
-        segments = librosa_classify_segments(segments, mono_mix)
-    else:
-        # Without librosa, classify purely by min_track_length
-        for seg in segments:
-            seg.is_track = seg.duration_s >= config.min_track_length
+        if not config.no_librosa:
+            print("\n--- Phase 2: Librosa Spectral Analysis ---")
+            segments = librosa_classify_segments(segments, analysis)
+        else:
+            for seg in segments:
+                seg.is_track = seg.duration_s >= config.min_track_length
 
-    # Final classification
-    tracks, bloopers = finalize_segments(segments, config.min_track_length)
+        tracks, bloopers = finalize_segments(segments, config.min_track_length)
 
-    # Output
-    if config.dry_run:
-        print_dry_run(segments, tracks, bloopers, config)
-    else:
-        print("\n--- Rendering ---")
-        render_outputs(stems, config.dbs, tracks, bloopers, config)
-        print("\nDone.")
-        if tracks:
-            print(f"Tracks saved to: {os.path.abspath(config.output_dir)}/track_*.mp3")
-        if bloopers:
-            print(f"Bloopers saved to: {os.path.abspath(config.output_dir)}/bloopers.mp3")
+        if config.dry_run:
+            print_dry_run(segments, tracks, bloopers, config, analysis.duration_s)
+        else:
+            if os.path.exists(analysis.mono_mix_path):
+                os.remove(analysis.mono_mix_path)
+                analysis.mono_mix_path = ""
+                gc.collect()
+
+            print("\n--- Rendering ---")
+            render_outputs(config.stem_paths, config.dbs, tracks, bloopers, config)
+            print("\nDone.")
+            if tracks:
+                print(f"Tracks saved to: {os.path.abspath(config.output_dir)}/track_*.mp3")
+            if bloopers:
+                print(f"Bloopers saved to: {os.path.abspath(config.output_dir)}/bloopers.mp3")
+    finally:
+        if analysis.mono_mix_path and os.path.exists(analysis.mono_mix_path):
+            os.remove(analysis.mono_mix_path)
 
 
 if __name__ == "__main__":
