@@ -297,9 +297,10 @@ def _parse_volumedetect_peak_db(stderr: str) -> float:
 
 def measure_mix_peak_db(stem_paths: List[str], dbs: List[float]) -> float:
     """
-    Measure peak level of the additive stem mix (volume per stem + amix normalize=0).
+    Measure peak level of the render-equivalent stem mix.
 
-    Uses ffmpeg volumedetect on a streamed filter graph — no full mix in RAM.
+    Uses the same filter chain as _render_range_ffmpeg (volume/anull per stem,
+    amix normalize=0, stereo aformat) plus volumedetect — no full mix in RAM.
     """
     inputs: List[str] = []
     for path in stem_paths:
@@ -307,16 +308,16 @@ def measure_mix_peak_db(stem_paths: List[str], dbs: List[float]) -> float:
 
     filter_parts: List[str] = []
     for i, db in enumerate(dbs):
-        chain = f"[{i}:a]"
         if db != 0:
-            chain += f"volume={db}dB,"
-        chain += "aformat=channel_layouts=mono"
-        filter_parts.append(f"{chain}[m{i}]")
+            filter_parts.append(f"[{i}:a]volume={db}dB[a{i}]")
+        else:
+            filter_parts.append(f"[{i}:a]anull[a{i}]")
 
     n_stems = len(stem_paths)
-    mix_inputs = "".join(f"[m{i}]" for i in range(n_stems))
+    mix_inputs = "".join(f"[a{i}]" for i in range(n_stems))
     filter_parts.append(
-        f"{mix_inputs}amix=inputs={n_stems}:duration=longest:normalize=0,volumedetect"
+        f"{mix_inputs}amix=inputs={n_stems}:duration=longest:normalize=0,"
+        f"aformat=channel_layouts=stereo,volumedetect"
     )
     filter_graph = ";".join(filter_parts)
 
@@ -331,7 +332,12 @@ def measure_mix_peak_db(stem_paths: List[str], dbs: List[float]) -> float:
         print(e.stderr[-2000:], file=sys.stderr)
         sys.exit(1)
 
-    return _parse_volumedetect_peak_db(result.stderr)
+    try:
+        return _parse_volumedetect_peak_db(result.stderr)
+    except ValueError as e:
+        print(f"\nffmpeg error (mix peak measurement): {e}", file=sys.stderr)
+        print(result.stderr[-2000:], file=sys.stderr)
+        sys.exit(1)
 
 
 def compute_anti_clip_gain(peak_db: float, target_db: float = TARGET_PEAK_DB) -> float:
@@ -344,6 +350,7 @@ def compute_anti_clip_gain(peak_db: float, target_db: float = TARGET_PEAK_DB) ->
 def resolve_mix_gains(config: Config) -> None:
     """Measure mix peak and set config.global_db for anti-clip normalization."""
     print("  Measuring mix peak for anti-clip gain ...")
+    # Full-session pass is intentional: peak must match the render filter graph.
     with _ElapsedIndicator("peak analysis"):
         measured_peak_db = measure_mix_peak_db(config.stem_paths, config.dbs)
     config.global_db = compute_anti_clip_gain(measured_peak_db)

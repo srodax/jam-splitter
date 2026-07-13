@@ -25,7 +25,7 @@ pip install -r requirements.txt
 ### Basic
 
 ```bash
-python jam_splitter.py \
+python jam-splitter.py \
   --stems guitar.wav bass_drums.wav
 ```
 
@@ -49,25 +49,25 @@ computed from the actual mix peak (not a simple `-20*log10(N)` default).
 
 ```bash
 # Aggressive splitting (more, shorter tracks)
-python jam_splitter.py --stems file1.wav file2.wav --aggression 8
+python jam-splitter.py --stems file1.wav file2.wav --aggression 8
 
 # Conservative (fewer, longer tracks)
-python jam_splitter.py --stems file1.wav file2.wav --aggression 2
+python jam-splitter.py --stems file1.wav file2.wav --aggression 2
 
 # Aggression preset + fine-tune one parameter
-python jam_splitter.py --stems file1.wav file2.wav --aggression 5 --min-track-length 90
+python jam-splitter.py --stems file1.wav file2.wav --aggression 5 --min-track-length 90
 ```
 
 ### Dry run (detect only, no rendering)
 
 ```bash
-python jam_splitter.py --stems file1.wav file2.wav --dry-run
+python jam-splitter.py --stems file1.wav file2.wav --dry-run
 ```
 
 ### Skip librosa (silence-only mode)
 
 ```bash
-python jam_splitter.py --stems file1.wav file2.wav --no-librosa
+python jam-splitter.py --stems file1.wav file2.wav --no-librosa
 ```
 
 ## Arguments
