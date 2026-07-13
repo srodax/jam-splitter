@@ -25,42 +25,49 @@ pip install -r requirements.txt
 ### Basic
 
 ```bash
-python jam_splitter.py \
+python jam-splitter.py \
   --stems guitar.wav bass_drums.wav
 ```
 
-### With per-stem dB control
+### With per-stem balance control
+
+`--dbs` sets **relative** levels between stems. The tool automatically measures
+the summed mix and applies a global gain so the full session stays near **-1 dBFS**
+(anti-clip). Relative offsets are preserved.
 
 ```bash
-python jam_splitter.py \
+python jam-splitter.py \
   --stems guitar.wav bass_drums.wav vocals.wav \
   --dbs 0 -3 2 \
   --output-dir ./my_session
 ```
 
+Without `--dbs`, all stems start at 0 dB relative balance; global gain is still
+computed from the actual mix peak (not a simple `-20*log10(N)` default).
+
 ### Tuning sensitivity
 
 ```bash
 # Aggressive splitting (more, shorter tracks)
-python jam_splitter.py --stems file1.wav file2.wav --aggression 8
+python jam-splitter.py --stems file1.wav file2.wav --aggression 8
 
 # Conservative (fewer, longer tracks)
-python jam_splitter.py --stems file1.wav file2.wav --aggression 2
+python jam-splitter.py --stems file1.wav file2.wav --aggression 2
 
 # Aggression preset + fine-tune one parameter
-python jam_splitter.py --stems file1.wav file2.wav --aggression 5 --min-track-length 90
+python jam-splitter.py --stems file1.wav file2.wav --aggression 5 --min-track-length 90
 ```
 
 ### Dry run (detect only, no rendering)
 
 ```bash
-python jam_splitter.py --stems file1.wav file2.wav --dry-run
+python jam-splitter.py --stems file1.wav file2.wav --dry-run
 ```
 
 ### Skip librosa (silence-only mode)
 
 ```bash
-python jam_splitter.py --stems file1.wav file2.wav --no-librosa
+python jam-splitter.py --stems file1.wav file2.wav --no-librosa
 ```
 
 ## Arguments
@@ -68,7 +75,7 @@ python jam_splitter.py --stems file1.wav file2.wav --no-librosa
 | Argument | Default | Description |
 |---|---|---|
 | `--stems` | (required) | One or more WAV files (must have identical duration) |
-| `--dbs` | all 0 | Per-stem dB levels in the mix |
+| `--dbs` | all 0 (relative) | Per-stem relative dB balance; global anti-clip gain applied automatically |
 | `--aggression` | 5 | 1-10 splitting aggression preset |
 | `--silence-thresh` | from aggression | Override: dBFS silence threshold |
 | `--min-silence-len` | from aggression | Override: min silence seconds for a split |

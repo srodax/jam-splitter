@@ -65,6 +65,10 @@ SILENCE_SEEK_STEP_MS = 10
 # 16-bit PCM full-scale (pydub default for WAV)
 MAX_POSSIBLE_AMPLITUDE = 32768.0
 
+# Anti-clip mix normalization (additive amix can exceed 0 dBFS)
+TARGET_PEAK_DB = -1.0
+SILENCE_PEAK_THRESHOLD_DB = -90.0
+
 
 # ---------------------------------------------------------------------------
 # Data classes
@@ -86,7 +90,7 @@ class Segment:
 class Config:
     """Resolved configuration after merging CLI args + aggression presets."""
     stem_paths: List[str]
-    dbs: List[float]
+    dbs: List[float]  # relative per-stem balance (before global anti-clip gain)
     silence_thresh: float
     min_silence_len: float  # seconds
     min_track_length: float  # seconds
@@ -95,6 +99,7 @@ class Config:
     dry_run: bool
     no_librosa: bool
     aggression: int
+    global_db: float = 0.0  # makeup/attenuation applied after relative dBs
 
 
 @dataclass
@@ -120,8 +125,9 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--dbs", nargs="*", type=float, default=None,
-        help="Per-stem dB level in the final mix (e.g. 0 -3 2). "
-             "Unmatched stems get 0 dB. Must not exceed stem count."
+        help="Relative per-stem dB balance in the mix (e.g. 0 -3 2). "
+             "Unmatched stems get 0 dB. Global anti-clip gain is applied "
+             "automatically so the summed mix stays near -1 dBFS."
     )
     parser.add_argument(
         "--aggression", type=int, default=5, choices=range(1, 11),
@@ -280,16 +286,89 @@ def _get_sample_rate(path: str) -> int:
     return int(float(result.stdout.strip()))
 
 
+def _parse_volumedetect_peak_db(stderr: str) -> float:
+    """Parse max_volume from ffmpeg volumedetect stderr."""
+    for line in stderr.splitlines():
+        if "max_volume:" in line:
+            token = line.split("max_volume:")[1].strip().split()[0]
+            return float(token)
+    raise ValueError("ffmpeg volumedetect did not report max_volume")
+
+
+def measure_mix_peak_db(stem_paths: List[str], dbs: List[float]) -> float:
+    """
+    Measure peak level of the render-equivalent stem mix.
+
+    Uses the same filter chain as _render_range_ffmpeg (volume/anull per stem,
+    amix normalize=0, stereo aformat) plus volumedetect — no full mix in RAM.
+    """
+    inputs: List[str] = []
+    for path in stem_paths:
+        inputs.extend(["-i", path])
+
+    filter_parts: List[str] = []
+    for i, db in enumerate(dbs):
+        if db != 0:
+            filter_parts.append(f"[{i}:a]volume={db}dB[a{i}]")
+        else:
+            filter_parts.append(f"[{i}:a]anull[a{i}]")
+
+    n_stems = len(stem_paths)
+    mix_inputs = "".join(f"[a{i}]" for i in range(n_stems))
+    filter_parts.append(
+        f"{mix_inputs}amix=inputs={n_stems}:duration=longest:normalize=0,"
+        f"aformat=channel_layouts=stereo,volumedetect"
+    )
+    filter_graph = ";".join(filter_parts)
+
+    cmd = (
+        ["ffmpeg", "-hide_banner", "-nostats"] + inputs +
+        ["-filter_complex", filter_graph, "-f", "null", "-"]
+    )
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True, check=True)
+    except subprocess.CalledProcessError as e:
+        print("\nffmpeg error (mix peak measurement):", file=sys.stderr)
+        print(e.stderr[-2000:], file=sys.stderr)
+        sys.exit(1)
+
+    try:
+        return _parse_volumedetect_peak_db(result.stderr)
+    except ValueError as e:
+        print(f"\nffmpeg error (mix peak measurement): {e}", file=sys.stderr)
+        print(result.stderr[-2000:], file=sys.stderr)
+        sys.exit(1)
+
+
+def compute_anti_clip_gain(peak_db: float, target_db: float = TARGET_PEAK_DB) -> float:
+    """Return global gain (dB) so mix peak lands at target_db; silence stays at 0."""
+    if peak_db <= SILENCE_PEAK_THRESHOLD_DB:
+        return 0.0
+    return target_db - peak_db
+
+
+def resolve_mix_gains(config: Config) -> None:
+    """Measure mix peak and set config.global_db for anti-clip normalization."""
+    print("  Measuring mix peak for anti-clip gain ...")
+    # Full-session pass is intentional: peak must match the render filter graph.
+    with _ElapsedIndicator("peak analysis"):
+        measured_peak_db = measure_mix_peak_db(config.stem_paths, config.dbs)
+    config.global_db = compute_anti_clip_gain(measured_peak_db)
+    effective_dbs = [db + config.global_db for db in config.dbs]
+    print(f"  Measured mix peak: {measured_peak_db:.1f} dBFS (relative stem balances)")
+    print(f"  Anti-clip global gain: {config.global_db:+.1f} dB → "
+          f"target {TARGET_PEAK_DB:.1f} dBFS")
+    for i, (rel_db, eff_db) in enumerate(zip(config.dbs, effective_dbs)):
+        name = os.path.basename(config.stem_paths[i])
+        print(f"    {name}: {eff_db:+.1f} dB effective (relative {rel_db:+.1f} dB)")
+
+
 # ---------------------------------------------------------------------------
 # Stem validation & analysis mix (memory-safe)
 # ---------------------------------------------------------------------------
 
-def prepare_analysis_mix(config: Config) -> AnalysisContext:
-    """
-    Validate stems via ffprobe, stream a full-rate mono mix to a temp WAV via ffmpeg.
-
-    The mix uses amix normalize=0 to match pydub overlay (additive, no divide).
-    """
+def validate_stems(config: Config) -> Tuple[float, int]:
+    """Validate stem files and return (reference_duration_s, sample_rate)."""
     if not config.stem_paths:
         print("Error: No stem files provided.", file=sys.stderr)
         sys.exit(1)
@@ -324,7 +403,20 @@ def prepare_analysis_mix(config: Config) -> AnalysisContext:
 
     print(f"Validated {len(config.stem_paths)} stem(s), duration: "
           f"{ref_dur_s/60:.1f} min ({ref_dur_s:.1f}s) @ {sample_rate} Hz")
+    return ref_dur_s, sample_rate
 
+
+def prepare_analysis_mix(
+    config: Config,
+    ref_dur_s: float,
+    sample_rate: int,
+) -> AnalysisContext:
+    """
+    Stream a full-rate mono mix to a temp WAV via ffmpeg.
+
+    The mix uses amix normalize=0 to match pydub overlay (additive, no divide),
+    plus config.global_db for anti-clip normalization.
+    """
     fd, mono_path = tempfile.mkstemp(suffix=".wav", prefix="jam_splitter_mono_")
     os.close(fd)
 
@@ -342,9 +434,10 @@ def prepare_analysis_mix(config: Config) -> AnalysisContext:
 
     mix_inputs = "".join(f"[m{i}]" for i in range(len(config.stem_paths)))
     n_stems = len(config.stem_paths)
-    filter_parts.append(
-        f"{mix_inputs}amix=inputs={n_stems}:duration=longest:normalize=0[aout]"
-    )
+    mix_tail = f"amix=inputs={n_stems}:duration=longest:normalize=0"
+    if config.global_db != 0:
+        mix_tail += f",volume={config.global_db}dB"
+    filter_parts.append(f"{mix_inputs}{mix_tail}[aout]")
     filter_graph = ";".join(filter_parts)
 
     cmd = (
@@ -812,7 +905,9 @@ def render_outputs(
         sys.stderr.flush()
 
         with _ElapsedIndicator("Encoding MP3"):
-            if not _render_range_ffmpeg(stem_paths, dbs, start_s, dur_s, out_path, config.bitrate):
+            if not _render_range_ffmpeg(
+                stem_paths, dbs, start_s, dur_s, out_path, config.bitrate, config.global_db,
+            ):
                 print(f"Error: failed to render {out_path}", file=sys.stderr)
                 sys.exit(1)
 
@@ -834,7 +929,9 @@ def render_outputs(
                 dur_s = seg.duration_s
                 sys.stderr.write(f"\r  Extracting blooper {i+1}/{len(bloopers)} ...")
                 sys.stderr.flush()
-                if not _render_range_ffmpeg(stem_paths, dbs, start_s, dur_s, tmp, "pcm_s16le"):
+                if not _render_range_ffmpeg(
+                    stem_paths, dbs, start_s, dur_s, tmp, "pcm_s16le", config.global_db,
+                ):
                     print(f"Error: failed to extract blooper segment {i+1}", file=sys.stderr)
                     sys.exit(1)
 
@@ -877,6 +974,7 @@ def _render_range_ffmpeg(
     dur_s: float,
     out_path: str,
     bitrate_or_codec: str,
+    global_db: float = 0.0,
 ) -> bool:
     """Render a time range from all stems via ffmpeg amix (normalize=0, pydub-compatible)."""
     inputs: List[str] = []
@@ -892,11 +990,11 @@ def _render_range_ffmpeg(
 
     mix_inputs = "".join(f"[a{i}]" for i in range(len(stem_paths)))
     n_stems = len(stem_paths)
+    mix_tail = f"amix=inputs={n_stems}:duration=longest:normalize=0"
+    if global_db != 0:
+        mix_tail += f",volume={global_db}dB"
     # Force stereo output to match pydub set_channels(2) on mono mixes
-    filter_parts.append(
-        f"{mix_inputs}amix=inputs={n_stems}:duration=longest:normalize=0,"
-        f"aformat=channel_layouts=stereo[out]"
-    )
+    filter_parts.append(f"{mix_inputs}{mix_tail},aformat=channel_layouts=stereo[out]")
     filter_graph = ";".join(filter_parts)
 
     cmd = (
@@ -986,8 +1084,14 @@ def main():
               "Install with: pip install librosa", file=sys.stderr)
         config.no_librosa = True
 
-    print("\n--- Stem validation & analysis mix ---")
-    analysis = prepare_analysis_mix(config)
+    print("\n--- Stem validation ---")
+    ref_dur_s, sample_rate = validate_stems(config)
+
+    print("\n--- Mix gain (anti-clip) ---")
+    resolve_mix_gains(config)
+
+    print("\n--- Analysis mix ---")
+    analysis = prepare_analysis_mix(config, ref_dur_s, sample_rate)
     gc.collect()
 
     try:
