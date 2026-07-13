@@ -31,18 +31,19 @@ import soundfile as sf
 
 # ---------------------------------------------------------------------------
 # Aggression preset table: aggression -> (silence_thresh_dBFS, min_silence_s, min_track_s)
-# ---------------------------------------------------------------------------
+# Thresholds are calibrated for the analysis mix (ffmpeg amix default normalize),
+# matching the pre-pydub-drop splitter that produced the preferred split behavior.
 AGGRESSION_PRESETS = {
-    1:  (-20.0, 3.0, 180),
-    2:  (-25.0, 2.5, 165),
-    3:  (-30.0, 2.0, 150),
-    4:  (-32.0, 1.8, 135),
-    5:  (-35.0, 1.5, 120),
-    6:  (-38.0, 1.2, 105),
-    7:  (-42.0, 1.0, 90),
-    8:  (-45.0, 0.8, 75),
-    9:  (-48.0, 0.6, 60),
-    10: (-50.0, 0.5, 60),
+    1:  (-21.0, 3.0, 180),
+    2:  (-26.0, 2.5, 165),
+    3:  (-31.0, 2.0, 150),
+    4:  (-33.0, 1.8, 135),
+    5:  (-36.0, 1.5, 120),
+    6:  (-39.0, 1.2, 105),
+    7:  (-43.0, 1.0, 90),
+    8:  (-46.0, 0.8, 75),
+    9:  (-49.0, 0.6, 60),
+    10: (-51.0, 0.5, 60),
 }
 
 # Musicality score weights for Phase 2 classification
@@ -414,8 +415,10 @@ def prepare_analysis_mix(
     """
     Stream a full-rate mono mix to a temp WAV via ffmpeg.
 
-    The mix uses amix normalize=0 to match pydub overlay (additive, no divide),
-    plus config.global_db for anti-clip normalization.
+    Uses relative stem balances only (no anti-clip global_db) and ffmpeg's
+    default amix normalize — same analysis loudness as the old pydub-era
+    splitter — so Phase 1 silence thresholds stay calibrated. Render still
+    applies normalize=0 + config.global_db.
     """
     fd, mono_path = tempfile.mkstemp(suffix=".wav", prefix="jam_splitter_mono_")
     os.close(fd)
@@ -434,10 +437,10 @@ def prepare_analysis_mix(
 
     mix_inputs = "".join(f"[m{i}]" for i in range(len(config.stem_paths)))
     n_stems = len(config.stem_paths)
-    mix_tail = f"amix=inputs={n_stems}:duration=longest:normalize=0"
-    if config.global_db != 0:
-        mix_tail += f",volume={config.global_db}dB"
-    filter_parts.append(f"{mix_inputs}{mix_tail}[aout]")
+    # Default amix normalize (omit normalize=0): matches old analysis mix levels.
+    filter_parts.append(
+        f"{mix_inputs}amix=inputs={n_stems}:duration=longest[aout]"
+    )
     filter_graph = ";".join(filter_parts)
 
     cmd = (
@@ -472,51 +475,66 @@ def _amp_thresh_from_dbfs(dbfs: float) -> float:
     return (10.0 ** (dbfs / 20.0)) * MAX_POSSIBLE_AMPLITUDE
 
 
-def _chunk_rms_amplitude(samples: np.ndarray) -> float:
-    """RMS amplitude on the same scale as pydub/audioop (0 .. 32768)."""
+def _chunk_mean_square(samples: np.ndarray) -> float:
+    """Mean-square of float samples in [-1, 1] (for rolling RMS windows)."""
     if samples.size == 0:
         return 0.0
-    rms = float(np.sqrt(np.mean(samples.astype(np.float64) ** 2)))
-    return rms * MAX_POSSIBLE_AMPLITUDE
+    return float(np.mean(samples.astype(np.float64) ** 2))
 
 
-def _detect_silent_ranges_ms(
+def _detect_silent_ranges_pydub(
+    chunk_mean_squares: np.ndarray,
     duration_ms: float,
     silence_thresh_dbfs: float,
     min_silence_len_ms: int,
     seek_step_ms: int,
-    rms_at_ms,
 ) -> List[Tuple[float, float]]:
     """
-    Replicate pydub.silence.detect_silence + invert for nonsilent ranges.
+    Replicate pydub.silence.detect_silence exactly.
 
-    rms_at_ms(start_ms) -> RMS amplitude for [start_ms, start_ms+seek_step_ms).
+    pydub does NOT require every seek_step slice to be silent. It slides a window
+    of length min_silence_len, steps by seek_step, and treats a position as a
+    silence start when that whole window's RMS is <= threshold. Overlapping
+    quiet windows are then merged into ranges.
     """
     amp_thresh = _amp_thresh_from_dbfs(silence_thresh_dbfs)
+    window_chunks = max(1, int(min_silence_len_ms // seek_step_ms))
+    n = int(chunk_mean_squares.shape[0])
+    if n < window_chunks or duration_ms < min_silence_len_ms:
+        return []
+
+    # Rolling mean of per-chunk mean-squares == mean-square of the window
+    # (chunks are equal length aside from a possible short tail, which we ignore
+    # for the sliding windows that fit fully — matching pydub's last_slice_start).
+    csum = np.concatenate(([0.0], np.cumsum(chunk_mean_squares, dtype=np.float64)))
+    silence_starts: List[int] = []
+    last_slice_start = n - window_chunks  # in chunk indices
+    for i in range(0, last_slice_start + 1):
+        mean_sq = (csum[i + window_chunks] - csum[i]) / window_chunks
+        window_rms_amp = float(np.sqrt(mean_sq)) * MAX_POSSIBLE_AMPLITUDE
+        if window_rms_amp <= amp_thresh:
+            silence_starts.append(i)
+
+    if not silence_starts:
+        return []
+
     silent_ranges: List[Tuple[float, float]] = []
-    in_silence = False
-    silence_start = 0.0
+    prev_i = silence_starts[0]
+    current_range_start = prev_i
 
-    pos_ms = 0.0
-    while pos_ms < duration_ms:
-        rms = rms_at_ms(pos_ms)
-        is_silent = rms <= amp_thresh
+    for silence_start_i in silence_starts[1:]:
+        continuous = silence_start_i == prev_i + 1
+        silence_has_gap = silence_start_i > (prev_i + window_chunks)
+        if not continuous and silence_has_gap:
+            start_ms = current_range_start * seek_step_ms
+            end_ms = (prev_i + window_chunks) * seek_step_ms
+            silent_ranges.append((float(start_ms), float(min(end_ms, duration_ms))))
+            current_range_start = silence_start_i
+        prev_i = silence_start_i
 
-        if is_silent:
-            if not in_silence:
-                silence_start = pos_ms
-                in_silence = True
-        elif in_silence:
-            silence_end = pos_ms
-            if silence_end - silence_start >= min_silence_len_ms:
-                silent_ranges.append((silence_start, silence_end))
-            in_silence = False
-
-        pos_ms += seek_step_ms
-
-    if in_silence and duration_ms - silence_start >= min_silence_len_ms:
-        silent_ranges.append((silence_start, duration_ms))
-
+    start_ms = current_range_start * seek_step_ms
+    end_ms = (prev_i + window_chunks) * seek_step_ms
+    silent_ranges.append((float(start_ms), float(min(end_ms, duration_ms))))
     return silent_ranges
 
 
@@ -525,14 +543,24 @@ def _invert_ranges(
     duration_ms: float,
 ) -> List[Tuple[float, float]]:
     """Convert silent ranges to non-silent ranges (pydub detect_nonsilent)."""
+    if not silent_ranges:
+        return [(0.0, duration_ms)]
+
+    if silent_ranges[0][0] == 0 and silent_ranges[0][1] >= duration_ms:
+        return []
+
     nonsilent: List[Tuple[float, float]] = []
     prev_end = 0.0
+    end_ms = 0.0
     for start_ms, end_ms in silent_ranges:
         if start_ms > prev_end:
             nonsilent.append((prev_end, start_ms))
         prev_end = end_ms
-    if prev_end < duration_ms:
+    if end_ms < duration_ms:
         nonsilent.append((prev_end, duration_ms))
+
+    if nonsilent and nonsilent[0] == (0.0, 0.0):
+        nonsilent.pop(0)
     return nonsilent
 
 
@@ -542,7 +570,7 @@ def detect_super_segments(
     min_silence_len_s: float,
 ) -> List[Segment]:
     """
-    Detect non-silent regions using chunked RMS scan over the mono mix file.
+    Detect non-silent regions using pydub-compatible sliding-window RMS.
     Returns list of Segments with start_ms, end_ms, duration_s.
     """
     min_silence_ms = int(min_silence_len_s * 1000)
@@ -552,43 +580,49 @@ def detect_super_segments(
     print(f"Phase 1: Scanning for silence gaps "
           f"(thresh={silence_thresh} dBFS, min_silence={min_silence_len_s}s) ...", flush=True)
 
-    # Block reader: load only small windows from disk
-    block_ms = 60_000  # 1 minute blocks
-    block_frames_cache: dict = {}
-
-    def rms_at_ms(pos_ms: float) -> float:
-        block_start_ms = int(pos_ms // block_ms) * block_ms
-        if block_start_ms not in block_frames_cache:
-            with sf.SoundFile(analysis.mono_mix_path, "r") as wav:
-                sr = wav.samplerate
-                start_frame = int(block_start_ms / 1000.0 * sr)
-                n_frames = int(block_ms / 1000.0 * sr)
-                wav.seek(start_frame)
-                data = wav.read(n_frames, dtype="float32", always_2d=True)
-                if data.ndim == 2:
-                    data = data.mean(axis=1)
-                block_frames_cache.clear()  # keep one block at a time
-                block_frames_cache[block_start_ms] = (sr, data)
-
-        sr, block = block_frames_cache[block_start_ms]
-        rel_ms = pos_ms - block_start_ms
-        start_frame = int(rel_ms / 1000.0 * sr)
-        end_frame = int((rel_ms + seek_step_ms) / 1000.0 * sr)
-        end_frame = max(end_frame, start_frame + 1)
-        chunk = block[start_frame:end_frame]
-        return _chunk_rms_amplitude(chunk)
+    # First pass: per-seek_step mean-square energy (float [-1,1] domain).
+    # Second pass: pydub sliding window of length min_silence_len.
+    n_chunks = int(np.ceil(duration_ms / seek_step_ms))
+    chunk_msq = np.zeros(n_chunks, dtype=np.float64)
+    block_ms = 60_000
 
     with _ElapsedIndicator("Scanning"):
-        silent_ranges = _detect_silent_ranges_ms(
+        with sf.SoundFile(analysis.mono_mix_path, "r") as wav:
+            sr = wav.samplerate
+            frames_per_step = max(1, int(seek_step_ms / 1000.0 * sr))
+            for block_start_ms in range(0, int(duration_ms) + 1, block_ms):
+                start_frame = int(block_start_ms / 1000.0 * sr)
+                n_frames = int(block_ms / 1000.0 * sr)
+                wav.seek(min(start_frame, len(wav)))
+                data = wav.read(n_frames, dtype="float32", always_2d=True)
+                if data.size == 0:
+                    break
+                if data.ndim == 2 and data.shape[1] > 1:
+                    data = data.mean(axis=1)
+                else:
+                    data = data.reshape(-1)
+
+                chunk_idx0 = block_start_ms // seek_step_ms
+                max_chunks_in_block = int(np.ceil(len(data) / frames_per_step))
+                for j in range(max_chunks_in_block):
+                    idx = chunk_idx0 + j
+                    if idx >= n_chunks:
+                        break
+                    a = j * frames_per_step
+                    b = min(a + frames_per_step, len(data))
+                    if a >= len(data):
+                        break
+                    chunk_msq[idx] = _chunk_mean_square(data[a:b])
+
+        silent_ranges = _detect_silent_ranges_pydub(
+            chunk_msq,
             duration_ms,
             silence_thresh,
             min_silence_ms,
             seek_step_ms,
-            rms_at_ms,
         )
         nonsilent_ranges = _invert_ranges(silent_ranges, duration_ms)
 
-    block_frames_cache.clear()
     gc.collect()
 
     if not nonsilent_ranges:

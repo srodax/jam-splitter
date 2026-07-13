@@ -89,11 +89,11 @@ python jam-splitter.py --stems file1.wav file2.wav --no-librosa
 
 | Aggression | Silence Thresh | Min Silence | Min Track | Behavior |
 |---|---|---|---|---|
-| 1 | -20 dBFS | 3.0s | 180s | Only dead silence; very long tracks |
-| 3 | -30 dBFS | 2.0s | 150s | Conservative |
-| **5** | **-35 dBFS** | **1.5s** | **120s** | **Default — balanced** |
-| 7 | -42 dBFS | 1.0s | 90s | Aggressive |
-| 10 | -50 dBFS | 0.5s | 60s | Any quiet moment; short segments |
+| 1 | -21 dBFS | 3.0s | 180s | Only dead silence; very long tracks |
+| 3 | -31 dBFS | 2.0s | 150s | Conservative |
+| **5** | **-36 dBFS** | **1.5s** | **120s** | **Default — balanced** |
+| 7 | -43 dBFS | 1.0s | 90s | Aggressive |
+| 10 | -51 dBFS | 0.5s | 60s | Any quiet moment; short segments |
 
 Explicit `--silence-thresh`, `--min-silence-len`, or `--min-track-length` override
 the aggression-derived value for that parameter only.
