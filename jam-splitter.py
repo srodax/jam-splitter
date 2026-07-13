@@ -834,9 +834,13 @@ def _find_onset_peaks(onset_env: np.ndarray) -> np.ndarray:
 
 def finalize_segments(segments: List[Segment], min_track_length: float) -> Tuple[List[Segment], List[Segment]]:
     """
-    Apply min_track_length filter with musicality as tie-breaker.
+    Classify segments as tracks or bloopers.
 
-    Classification logic:
+    When musicality_score is None (Phase 2 skipped or unavailable):
+      - duration < min_track_length → blooper
+      - duration >= min_track_length → track
+
+    When musicality_score is set (librosa Phase 2):
       - duration < min_track_length → blooper (regardless of score)
       - duration >= min_track_length AND score >= MUSICALITY_THRESHOLD → TRACK
       - duration >= min_track_length AND score < MUSICALITY_LOW_THRESHOLD → blooper
@@ -847,15 +851,16 @@ def finalize_segments(segments: List[Segment], min_track_length: float) -> Tuple
     tracks = []
     bloopers = []
     for seg in segments:
-        score = seg.musicality_score if seg.musicality_score is not None else 0.0
-
         if seg.duration_s < min_track_length:
             seg.is_track = False
             bloopers.append(seg)
-        elif score >= MUSICALITY_THRESHOLD:
+        elif seg.musicality_score is None:
             seg.is_track = True
             tracks.append(seg)
-        elif score < MUSICALITY_LOW_THRESHOLD:
+        elif seg.musicality_score >= MUSICALITY_THRESHOLD:
+            seg.is_track = True
+            tracks.append(seg)
+        elif seg.musicality_score < MUSICALITY_LOW_THRESHOLD:
             seg.is_track = False
             bloopers.append(seg)
         else:
@@ -1097,9 +1102,6 @@ def main():
         if not config.no_librosa:
             print("\n--- Phase 2: Librosa Spectral Analysis ---")
             segments = librosa_classify_segments(segments, analysis)
-        else:
-            for seg in segments:
-                seg.is_track = seg.duration_s >= config.min_track_length
 
         tracks, bloopers = finalize_segments(segments, config.min_track_length)
 
