@@ -13,12 +13,11 @@ Medleys (back-to-back songs without silence) are intentionally kept as single tr
 
 import argparse
 import os
-import subprocess
 import sys
 import threading
 import time
 import warnings
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import List, Optional, Tuple
 
 import numpy as np
@@ -227,113 +226,72 @@ def _format_size(num_bytes: int) -> str:
 
 
 # ---------------------------------------------------------------------------
-# ffmpeg helpers
+# Stem loading & validation
 # ---------------------------------------------------------------------------
 
-def _run_ffmpeg(cmd: List[str], label: str = "") -> bool:
-    """Run ffmpeg, printing output on failure. Returns True on success."""
-    try:
-        subprocess.run(cmd, check=True, capture_output=True, text=True)
-        return True
-    except subprocess.CalledProcessError as e:
-        print(f"\nffmpeg error ({label}):", file=sys.stderr)
-        print(e.stderr[-2000:], file=sys.stderr)
-        return False
-
-
-def _get_duration_seconds(path: str) -> float:
-    """Get audio duration in seconds via ffprobe."""
-    result = subprocess.run(
-        ["ffprobe", "-v", "error", "-show_entries", "format=duration",
-         "-of", "default=noprint_wrappers=1:nokey=1", path],
-        capture_output=True, text=True, check=True,
-    )
-    return float(result.stdout.strip())
-
-
-# ---------------------------------------------------------------------------
-# Stem loading & validation (ffmpeg-based — memory-safe)
-# ---------------------------------------------------------------------------
-
-def load_and_validate_stems(config: Config) -> Tuple[List[str], AudioSegment, float]:
+def load_and_validate_stems(config: Config) -> Tuple[List[AudioSegment], AudioSegment]:
     """
-    Validate all stems via ffprobe, create a downsampled mono mix via ffmpeg,
-    load only the tiny mono mix into pydub for analysis.
-
-    Returns: (stem_paths, mono_mix_audiosegment, total_duration_s)
+    Load all stems as pydub AudioSegments, validate equal length,
+    return (list_of_stems, mono_mixdown).
     """
     if not config.stem_paths:
         print("Error: No stem files provided.", file=sys.stderr)
         sys.exit(1)
 
-    # Validate existence and equal duration via ffprobe
+    stems = []
     durations = []
-    for path in config.stem_paths:
+    for i, path in enumerate(config.stem_paths):
         if not os.path.exists(path):
             print(f"Error: File not found: {path}", file=sys.stderr)
             sys.exit(1)
-        dur = _get_duration_seconds(path)
-        durations.append(dur)
-        file_size = os.path.getsize(path)
-        print(f"  Stem: {os.path.basename(path)} "
-              f"({_format_size(file_size)}, {dur/60:.1f} min)")
 
+        file_size = os.path.getsize(path)
+        label = (f"Loading stem {i+1}/{len(config.stem_paths)}: "
+                 f"{os.path.basename(path)} ({_format_size(file_size)})")
+        print(label, flush=True)
+
+        with _ElapsedIndicator("Decoding WAV via ffmpeg..."):
+            seg = AudioSegment.from_file(path)
+
+        stems.append(seg)
+        durations.append(len(seg))
+        print(f"  → loaded in {durations[-1]/1000:.1f}s")
+
+    # Validate equal length
     ref_dur = durations[0]
     for i, dur in enumerate(durations[1:], start=2):
-        diff = abs(dur - ref_dur)
-        if diff > 0.1:
-            print(f"Error: Stem {i} duration ({dur:.1f}s) differs from "
-                  f"stem 1 ({ref_dur:.1f}s) by {diff:.1f}s.", file=sys.stderr)
+        diff_ms = abs(dur - ref_dur)
+        if diff_ms > 100:  # allow 100ms tolerance
+            print(f"Error: Stem {i} duration ({dur/1000:.1f}s) differs from "
+                  f"stem 1 ({ref_dur/1000:.1f}s) by {diff_ms/1000:.1f}s. "
+                  f"All stems must have identical duration.", file=sys.stderr)
             sys.exit(1)
+        elif diff_ms > 0:
+            print(f"Note: Stem {i} differs from stem 1 by {diff_ms}ms — "
+                  f"within tolerance, continuing.")
 
-    total_s = ref_dur
-    print(f"  Total: {len(config.stem_paths)} stem(s), {total_s/60:.1f} min")
+    total_duration_s = ref_dur / 1000.0
+    print(f"Loaded {len(stems)} stem(s), duration: "
+          f"{total_duration_s/60:.1f} min ({total_duration_s:.1f}s)")
 
-    # Build ffmpeg filter for downsampled mono mix
-    # Use amix to mix all stems (streaming, low memory)
-    inputs = []
-    for path in config.stem_paths:
-        inputs.extend(["-i", path])
-
-    # Build filter: for each input, apply volume, then amix, then downmix+resample
-    filter_parts = []
-    for i, db in enumerate(config.dbs):
+    # Apply dB gain and create mono mixdown for analysis
+    adjusted_stems = []
+    for i, (stem, db) in enumerate(zip(stems, config.dbs)):
         if db != 0:
-            filter_parts.append(f"[{i}:a]volume={db}dB[a{i}]")
-            filter_parts.append(f"[a{i}]aformat=sample_fmts=s16:channel_layouts=mono[m{i}]")
+            stem = stem.apply_gain(db)
+        # Convert to mono for mixing
+        if stem.channels > 1:
+            mono = stem.set_channels(1)
         else:
-            filter_parts.append(f"[{i}:a]aformat=sample_fmts=s16:channel_layouts=mono[m{i}]")
+            mono = stem
+        adjusted_stems.append(mono)
 
-    mix_inputs = "".join(f"[m{i}]" for i in range(len(config.stem_paths)))
-    filter_parts.append(
-        f"{mix_inputs}amix=inputs={len(config.stem_paths)}:duration=longest,"
-        f"aresample=16000[aout]"
-    )
+    # Mix down to mono: overlay all stems
+    mixed = adjusted_stems[0]
+    for s in adjusted_stems[1:]:
+        mixed = mixed.overlay(s)
 
-    filter_graph = ";".join(filter_parts)
-
-    mono_path = "/tmp/jam_splitter_mono.wav"
-    cmd = (
-        ["ffmpeg", "-y"] + inputs +
-        ["-filter_complex", filter_graph,
-         "-map", "[aout]", "-ac", "1", "-ar", "16000",
-         "-c:a", "pcm_s16le", mono_path]
-    )
-
-    print("  Creating downsampled mono mix via ffmpeg ...")
-    with _ElapsedIndicator("ffmpeg mixdown"):
-        if not _run_ffmpeg(cmd, "mono mixdown"):
-            print("Error: ffmpeg mixdown failed.", file=sys.stderr)
-            sys.exit(1)
-
-    mono_size = os.path.getsize(mono_path)
-    print(f"  Mono mix: {_format_size(mono_size)} @ 16kHz")
-
-    # Load only the tiny mono mix into pydub for analysis
-    with _ElapsedIndicator("Loading mono mix into pydub"):
-        mono = AudioSegment.from_file(mono_path)
-
-    return config.stem_paths, mono, total_s
+    return stems, mixed
 
 
 # ---------------------------------------------------------------------------
@@ -685,118 +643,85 @@ def finalize_segments(segments: List[Segment], min_track_length: float) -> Tuple
 # ---------------------------------------------------------------------------
 
 def render_outputs(
-    stem_paths: List[str],
+    stems: List[AudioSegment],
     dbs: List[float],
     tracks: List[Segment],
     bloopers: List[Segment],
     config: Config,
 ):
-    """Render tracks and bloopers using ffmpeg (streaming, low memory)."""
+    """Render tracks and bloopers to MP3 files."""
     os.makedirs(config.output_dir, exist_ok=True)
 
-    # Render individual tracks
+    # Render tracks
     for i, seg in enumerate(tracks):
         out_path = os.path.join(config.output_dir, f"track_{i+1:02d}.mp3")
-        start_s = (seg.onset_refined_start_ms if seg.onset_refined_start_ms is not None
-                   else seg.start_ms) / 1000.0
-        end_s = (seg.onset_refined_end_ms if seg.onset_refined_end_ms is not None
-                 else seg.end_ms) / 1000.0
-        dur_s = end_s - start_s
-
-        label = f"Rendering track {i+1}/{len(tracks)} ({dur_s:.1f}s)"
+        label = f"Rendering track {i+1}/{len(tracks)} ({seg.duration_s:.1f}s)"
         sys.stderr.write(f"\r  {label} ...")
         sys.stderr.flush()
 
-        with _ElapsedIndicator("Encoding MP3"):
-            _render_range_ffmpeg(stem_paths, dbs, start_s, dur_s, out_path, config.bitrate)
+        start_ms = seg.onset_refined_start_ms if seg.onset_refined_start_ms is not None else seg.start_ms
+        end_ms = seg.onset_refined_end_ms if seg.onset_refined_end_ms is not None else seg.end_ms
+        start_ms = int(start_ms)
+        end_ms = int(end_ms)
 
-        sys.stderr.write(f"\r  {label} -> {out_path}\n")
+        with _ElapsedIndicator("Encoding MP3"):
+            mixed = _mix_stems_range(stems, dbs, start_ms, end_ms)
+            mixed.export(out_path, format="mp3", bitrate=config.bitrate)
+
+        sys.stderr.write(f"\r  {label} → {out_path}\n")
         sys.stderr.flush()
 
-    # Render bloopers — concatenate via ffmpeg concat demuxer
+    # Render bloopers (concatenated chronologically)
     if bloopers:
         out_path = os.path.join(config.output_dir, "bloopers.mp3")
         total_blooper_s = sum(s.duration_s for s in bloopers)
         print(f"Rendering bloopers: {len(bloopers)} segments ({total_blooper_s:.1f}s total)")
 
-        # Render each blooper to a temp WAV, then concat
-        temp_files = []
+        blooper_chunks = []
         for i, seg in enumerate(bloopers):
-            tmp = f"/tmp/jam_splitter_blooper_{i:04d}.wav"
-            temp_files.append(tmp)
-            start_s = seg.start_ms / 1000.0
-            dur_s = seg.duration_s
-            sys.stderr.write(f"\r  Extracting bloopers {i+1}/{len(bloopers)} ...")
+            sys.stderr.write(f"\r  Extracting blooper {i+1}/{len(bloopers)} ...")
             sys.stderr.flush()
-            _render_range_ffmpeg(stem_paths, dbs, start_s, dur_s, tmp, "pcm_s16le")
+            start_ms = int(seg.start_ms)
+            end_ms = int(seg.end_ms)
+            chunk = _mix_stems_range(stems, dbs, start_ms, end_ms)
+            blooper_chunks.append(chunk)
 
         sys.stderr.write("\r" + " " * 80 + "\r")
         sys.stderr.flush()
 
-        # Concat via ffmpeg concat demuxer
-        concat_list = "/tmp/jam_splitter_concat.txt"
-        with open(concat_list, "w") as f:
-            for tf in temp_files:
-                f.write(f"file '{tf}'\n")
+        if blooper_chunks:
+            print(f"  Concatenating {len(blooper_chunks)} chunks ...")
+            combined = blooper_chunks[0]
+            for chunk in blooper_chunks[1:]:
+                combined = combined.append(chunk, crossfade=0)
 
-        print(f"  Concatenating {len(temp_files)} blooper chunks ...")
-        with _ElapsedIndicator("Encoding bloopers MP3"):
-            subprocess.run(
-                ["ffmpeg", "-y", "-f", "concat", "-safe", "0",
-                 "-i", concat_list, "-c:a", "libmp3lame",
-                 "-b:a", config.bitrate, out_path],
-                check=True, capture_output=True,
-            )
-
-        # Cleanup temp files
-        for tf in temp_files:
-            os.remove(tf)
-        os.remove(concat_list)
-
-        print(f"  -> {out_path}")
+            with _ElapsedIndicator("Encoding bloopers MP3"):
+                combined.export(out_path, format="mp3", bitrate=config.bitrate)
+            print(f"  → {out_path}")
     else:
         print("No bloopers to render.")
 
 
-def _render_range_ffmpeg(
-    stem_paths: List[str],
+def _mix_stems_range(
+    stems: List[AudioSegment],
     dbs: List[float],
-    start_s: float,
-    dur_s: float,
-    out_path: str,
-    bitrate_or_codec: str,
-):
-    """Render a time range from all stems via ffmpeg amix filter."""
-    inputs = []
-    for path in stem_paths:
-        inputs.extend(["-ss", str(start_s), "-i", path])
-
-    filter_parts = []
-    for i, db in enumerate(dbs):
+    start_ms: int,
+    end_ms: int,
+) -> AudioSegment:
+    """Mix all stems for a given time range with per-stem dB levels."""
+    mixed = None
+    for i, (stem, db) in enumerate(zip(stems, dbs)):
+        chunk = stem[start_ms:end_ms]
         if db != 0:
-            filter_parts.append(f"[{i}:a]volume={db}dB[a{i}]")
+            chunk = chunk.apply_gain(db)
+        if mixed is None:
+            mixed = chunk
         else:
-            filter_parts.append(f"[{i}:a]anull[a{i}]")
-
-    mix_inputs = "".join(f"[a{i}]" for i in range(len(stem_paths)))
-    filter_parts.append(f"{mix_inputs}amix=inputs={len(stem_paths)}:duration=longest")
-
-    filter_graph = ";".join(filter_parts)
-
-    cmd = (
-        ["ffmpeg", "-y"] + inputs + ["-t", str(dur_s),
-         "-filter_complex", filter_graph,
-         "-map_metadata", "-1"]
-    )
-
-    # Determine output codec
-    if out_path.endswith(".mp3"):
-        cmd.extend(["-c:a", "libmp3lame", "-b:a", bitrate_or_codec])
-    else:
-        cmd.extend(["-c:a", bitrate_or_codec])
-
-    cmd.append(out_path)
-    _run_ffmpeg(cmd, f"render {os.path.basename(out_path)}")
+            mixed = mixed.overlay(chunk)
+    # Convert to stereo if mono
+    if mixed.channels == 1:
+        mixed = mixed.set_channels(2)
+    return mixed
 
 
 # ---------------------------------------------------------------------------
@@ -870,8 +795,8 @@ def main():
               "Install with: pip install librosa", file=sys.stderr)
         config.no_librosa = True
 
-    # Load and validate stems (ffmpeg-based, memory-safe)
-    stem_paths, mono_mix, total_duration = load_and_validate_stems(config)
+    # Load and validate stems
+    stems, mono_mix = load_and_validate_stems(config)
 
     # Phase 1: Silence detection
     print("\n--- Phase 1: Silence Detection ---")
@@ -902,17 +827,12 @@ def main():
         print_dry_run(segments, tracks, bloopers, config)
     else:
         print("\n--- Rendering ---")
-        render_outputs(stem_paths, config.dbs, tracks, bloopers, config)
+        render_outputs(stems, config.dbs, tracks, bloopers, config)
         print("\nDone.")
         if tracks:
             print(f"Tracks saved to: {os.path.abspath(config.output_dir)}/track_*.mp3")
         if bloopers:
             print(f"Bloopers saved to: {os.path.abspath(config.output_dir)}/bloopers.mp3")
-
-    # Cleanup temp mono mix
-    mono_tmp = "/tmp/jam_splitter_mono.wav"
-    if os.path.exists(mono_tmp):
-        os.remove(mono_tmp)
 
 
 if __name__ == "__main__":
